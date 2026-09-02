@@ -25,6 +25,130 @@ static void glfw_error_callback(int error, const char* description)
     fprintf(stderr, "Glfw Error %d: %s\n", error, description);
 }
 
+// Bundles everything a single rendered frame needs, so it can be produced both
+// from the main loop and from the GLFW refresh callback (which fires during
+// the live window-resize modal loop on macOS, where glfwPollEvents() blocks).
+struct AppState
+{
+    id <MTLDevice> device;
+    id <MTLCommandQueue> commandQueue;
+    CAMetalLayer* layer;
+    MTLRenderPassDescriptor* renderPassDescriptor;
+    bool show_demo_window = true;
+    bool show_another_window = false;
+    float clear_color[4] = {0.45f, 0.55f, 0.60f, 1.00f};
+};
+
+// sync_to_transaction is only needed while actively dragging to resize, to stay glued to
+// AppKit's resize transaction (see comment near presentDrawable below). Left on permanently
+// it forces synchronous presentation every frame, defeating normal vsync pacing/triple
+// buffering and causing needlessly high CPU usage and an uncapped frame rate.
+static void render_frame(GLFWwindow* window, bool sync_to_transaction = false)
+{
+    AppState* state = (AppState*)glfwGetWindowUserPointer(window);
+
+    @autoreleasepool
+    {
+        int fb_width, fb_height;
+        glfwGetFramebufferSize(window, &fb_width, &fb_height);
+        ImGuiIO& io = ImGui::GetIO();
+        io.DisplaySize = ImVec2((float)fb_width, (float)fb_height);
+        state->layer.drawableSize = CGSizeMake(fb_width, fb_height);
+        state->layer.presentsWithTransaction = sync_to_transaction;
+        id<CAMetalDrawable> drawable = [state->layer nextDrawable];
+        if (drawable == nil)
+            return;
+
+        id<MTLCommandBuffer> commandBuffer = [state->commandQueue commandBuffer];
+        state->renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(state->clear_color[0] * state->clear_color[3], state->clear_color[1] * state->clear_color[3], state->clear_color[2] * state->clear_color[3], state->clear_color[3]);
+        state->renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
+        state->renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
+        state->renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:state->renderPassDescriptor];
+        [renderEncoder pushDebugGroup:@"ImGui demo"];
+
+        // Start the Dear ImGui frame
+        ImGui_ImplMetal_NewFrame(state->renderPassDescriptor);
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
+        if (state->show_demo_window)
+            ImGui::ShowDemoWindow(&state->show_demo_window);
+
+        // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
+        {
+            static float f = 0.0f;
+            static int counter = 0;
+
+            ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
+
+            ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
+            ImGui::Checkbox("Demo Window", &state->show_demo_window); // Edit bools storing our window open/close state
+            ImGui::Checkbox("Another Window", &state->show_another_window);
+
+            ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
+            ImGui::ColorEdit3("clear color", state->clear_color);   // Edit 3 floats representing a color
+
+            if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
+                counter++;
+            ImGui::SameLine();
+            ImGui::Text("counter = %d", counter);
+
+            ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+            ImGui::End();
+        }
+
+        // 3. Show another simple window.
+        if (state->show_another_window)
+        {
+            ImGui::Begin("Another Window", &state->show_another_window); // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
+            ImGui::Text("Hello from another window!");
+            if (ImGui::Button("Close Me"))
+                state->show_another_window = false;
+            ImGui::End();
+        }
+
+        // Rendering
+        ImGui::Render();
+        ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), commandBuffer, renderEncoder);
+
+        // Update and Render additional Platform Windows
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        {
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        }
+
+        [renderEncoder popDebugGroup];
+        [renderEncoder endEncoding];
+
+        // based on https://thume.ca/2019/06/19/glitchless-metal-window-resizing/
+        // presentsWithTransaction requires presenting the drawable directly (synchronously,
+        // on this thread) so it lands inside the same CATransaction AppKit uses to resize
+        // the window frame. [commandBuffer presentDrawable:] instead defers presentation to
+        // a completion handler, which desyncs from that transaction and causes jitter.
+        // Only worth the synchronous stall while actually resizing; otherwise let Metal
+        // pace presentation normally so we don't spin faster than the display refresh.
+        if (sync_to_transaction)
+        {
+            [commandBuffer commit];
+            [commandBuffer waitUntilScheduled];
+            [drawable present];
+        }
+        else
+        {
+            [commandBuffer presentDrawable:drawable];
+            [commandBuffer commit];
+        }
+    }
+}
+
+static void glfw_window_size_callback(GLFWwindow* window, int, int)
+{
+    render_frame(window, true);
+}
+
 int main(int, char**)
 {
     glfwSetErrorCallback(glfw_error_callback);
@@ -97,97 +221,29 @@ int main(int, char**)
     nswin.contentView.layer = layer;
     nswin.contentView.wantsLayer = YES;
 
-    MTLRenderPassDescriptor *renderPassDescriptor = [MTLRenderPassDescriptor new];
+    AppState state;
+    state.device = device;
+    state.commandQueue = commandQueue;
+    state.layer = layer;
+    state.renderPassDescriptor = [MTLRenderPassDescriptor new];
 
-    // Our state
-    bool show_demo_window = true;
-    bool show_another_window = false;
-    float clear_color[4] = {0.45f, 0.55f, 0.60f, 1.00f};
+    // On macOS a live window resize runs a nested event-tracking loop that blocks
+    // glfwPollEvents() until the drag ends. GLFW's window-size callback (unlike the
+    // refresh callback, which depends on AppKit calling -updateLayer) fires
+    // synchronously from that loop, so we render from it to keep content live during resize.
+    glfwSetWindowUserPointer(window, &state);
+    glfwSetWindowSizeCallback(window, glfw_window_size_callback);
 
     // Main loop
     while (!glfwWindowShouldClose(window))
     {
-        @autoreleasepool
-        {
-            // Poll and handle events (inputs, window resize, etc.)
-            // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
-            // - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application, or clear/overwrite your copy of the mouse data.
-            // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application, or clear/overwrite your copy of the keyboard data.
-            // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
-            glfwPollEvents();
-
-            int width, height;
-            glfwGetFramebufferSize(window, &width, &height);
-            layer.drawableSize = CGSizeMake(width, height);
-            id<CAMetalDrawable> drawable = [layer nextDrawable];
-
-            id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-            renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(clear_color[0] * clear_color[3], clear_color[1] * clear_color[3], clear_color[2] * clear_color[3], clear_color[3]);
-            renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
-            renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-            renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-            id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
-            [renderEncoder pushDebugGroup:@"ImGui demo"];
-
-            // Start the Dear ImGui frame
-            ImGui_ImplMetal_NewFrame(renderPassDescriptor);
-            ImGui_ImplGlfw_NewFrame();
-            ImGui::NewFrame();
-
-            // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
-            if (show_demo_window)
-                ImGui::ShowDemoWindow(&show_demo_window);
-
-            // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
-            {
-                static float f = 0.0f;
-                static int counter = 0;
-
-                ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
-
-                ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
-                ImGui::Checkbox("Demo Window", &show_demo_window);      // Edit bools storing our window open/close state
-                ImGui::Checkbox("Another Window", &show_another_window);
-
-                ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
-                ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
-
-                if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-                    counter++;
-                ImGui::SameLine();
-                ImGui::Text("counter = %d", counter);
-
-                ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
-                ImGui::End();
-            }
-
-            // 3. Show another simple window.
-            if (show_another_window)
-            {
-                ImGui::Begin("Another Window", &show_another_window);   // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
-                ImGui::Text("Hello from another window!");
-                if (ImGui::Button("Close Me"))
-                    show_another_window = false;
-                ImGui::End();
-            }
-
-            // Rendering
-            ImGui::Render();
-            ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), commandBuffer, renderEncoder);
-
-            // Update and Render additional Platform Windows
-            if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
-            {
-                ImGui::UpdatePlatformWindows();
-                ImGui::RenderPlatformWindowsDefault();
-            }
-
-            [renderEncoder popDebugGroup];
-            [renderEncoder endEncoding];
-
-            [commandBuffer presentDrawable:drawable];
-            [commandBuffer commit];
-        }
+        // Poll and handle events (inputs, window resize, etc.)
+        // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
+        // - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application, or clear/overwrite your copy of the mouse data.
+        // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application, or clear/overwrite your copy of the keyboard data.
+        // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
+        glfwPollEvents();
+        render_frame(window);
     }
 
     // Cleanup
