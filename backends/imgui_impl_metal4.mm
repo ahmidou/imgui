@@ -21,6 +21,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2026-09-26: Metal 4: evict textures not drawn for framesInFlight+2 frames from the residency set (fixes user textures never being released).
 //  2026-09-07: Round framebuffer dimensions to the nearest integer instead of truncating them. (#9538, 9515, #8628)
 //  2026-08-06: Metal 4: fixed resizing windows losing framebuffer scale. (#6828, #8856)
 //  2026-07-07: Metal 4: Added metal-cpp support. (#9461)
@@ -159,16 +160,22 @@ bool ImGui_ImplMetal_CreateDeviceObjects(MTL::Device* device)
 // command (a user texture or one of our ImTextureData textures). Tracking the frame it was last used lets
 // stale textures — e.g. the fresh-sized drawables a CAMetalLayer produces every frame during a live resize,
 // or user textures the app stopped drawing — be evicted instead of accumulating in the set forever. The
-// residency set retains its allocations, so this also keeps a texture alive until its last frame has
-// completed on the GPU (Metal 4 command buffers don't retain the resources they reference), after which
-// eviction drops that reference and a texture the app has released is freed.
-static void ImGui_ImplMetal4_TrackResidentTexture(MetalContext* ctx, id<MTLTexture> texture)
+// residentTextures map holds strong references (as does the residency set), so this also keeps a texture
+// alive until its last frame has completed on the GPU (Metal 4 command buffers don't retain the resources
+// they reference), after which eviction drops those references and a texture the app has released is freed.
+// Returns true if the texture was added to the residency set (the caller must see that it gets committed).
+static bool ImGui_ImplMetal4_TrackResidentTexture(MetalContext* ctx, id<MTLTexture> texture)
 {
     if (texture == nil)
-        return;
+        return false;
+    bool added = false;
     if ([ctx.residentTextures objectForKey:texture] == nil)
+    {
         [ctx.residencySet addAllocation:texture];
+        added = true;
+    }
     [ctx.residentTextures setObject:@(ctx.residencyFrameCounter) forKey:texture];
+    return added;
 }
 
 void ImGui_ImplMetal4_NewFrame(MTL4RenderPassDescriptor* renderPassDescriptor, int frameInFlightIndex)
@@ -208,9 +215,10 @@ void ImGui_ImplMetal4_NewFrame(MTL4RenderPassDescriptor* renderPassDescriptor, i
         [ctx.residencySet removeAllocation:texture];
         [ctx.residentTextures removeObjectForKey:texture];
     }
-    if (staleTextures != nil)
+    // Commit here rather than relying on RenderDrawData, which returns early when there is nothing to draw.
+    bool drawableAdded = ImGui_ImplMetal4_TrackResidentTexture(ctx, renderPassDescriptor.colorAttachments[0].texture);
+    if (staleTextures != nil || drawableAdded)
         [ctx.residencySet commit];
-    ImGui_ImplMetal4_TrackResidentTexture(ctx, renderPassDescriptor.colorAttachments[0].texture);
 
     bd->SharedMetalContext.currentConstantBufferIndex = 0;
     [bd->SharedMetalContext.commandAllocators[frameInFlightIndex] reset];
@@ -348,6 +356,7 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
     // Render command lists
     size_t vertexBufferOffset = 0;
     size_t indexBufferOffset = 0;
+    id<MTLTexture> lastTrackedTexture = nil; // consecutive draw commands mostly use the same texture: track it once
     for (const ImDrawList* draw_list : draw_data->CmdLists)
     {
         memcpy((char*)vertexBuffer.buffer.contents + vertexBufferOffset, draw_list->VtxBuffer.Data, (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
@@ -395,7 +404,11 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
                 if (tex_id != ImTextureID_Invalid)
                 {
                     id<MTLTexture> texture = (__bridge id<MTLTexture>)(void*)(intptr_t)tex_id;
-                    ImGui_ImplMetal4_TrackResidentTexture(ctx, texture);
+                    if (texture != lastTrackedTexture)
+                    {
+                        ImGui_ImplMetal4_TrackResidentTexture(ctx, texture);
+                        lastTrackedTexture = texture;
+                    }
                     [bd->SharedMetalContext.currentArgumentTable setTexture:texture.gpuResourceID atIndex:0];
                 }
 
@@ -981,7 +994,9 @@ static void ImGui_ImplMetal_RenderWindow(ImGuiViewport* viewport, void*)
     ImGui_ImplMetal4_Data* bd = ImGui_ImplMetal4_GetBackendData();
     // The secondary-viewport render pass is hand-built here too, so make its render-target texture
     // resident (tracked so it can be evicted once stale) before RenderDrawData commits the residency set.
-    ImGui_ImplMetal4_TrackResidentTexture(bd->SharedMetalContext, drawable.texture);
+    // Committed here too, as RenderDrawData returns early when there is nothing to draw.
+    if (ImGui_ImplMetal4_TrackResidentTexture(bd->SharedMetalContext, drawable.texture))
+        [bd->SharedMetalContext.residencySet commit];
     id <MTL4CommandBuffer> commandBuffer = [bd->SharedMetalContext.device newCommandBuffer];
     [commandBuffer beginCommandBufferWithAllocator:bd->SharedMetalContext.commandAllocators[bd->SharedMetalContext.currentFrameSlot]];
 

@@ -97,6 +97,9 @@ Other Changes:
 - Demo:
   - Added `Widgets->Mixed Values` section. (#5518, #5677, #6865)
 - Backends:
+  - Metal4: evict textures not drawn for framesInFlight+2 frames from the residency set, which
+    retains them: user textures (ImTextureID) were never released once drawn. Font atlas textures
+    are now made resident when drawn rather than at creation.
   - QNX: added QNX Screen backend. (#9492) [@mgorchak-blackberry]
   - SDL2: fixed querying framebuffer scale/density when using Metal without
     going through a SDL_Renderer. (#5592) [@lailoken]
