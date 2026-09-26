@@ -34,6 +34,9 @@
 // framesInFlight must match the number of frames your application keeps in flight (e.g. the size of your own
 // command buffer/allocator ring). The backend uses it to size its own per-frame-in-flight resources (constant
 // buffer, vertex/index buffer cache) so the CPU never overwrites a slot the GPU may still be reading.
+// A user texture drawn via ImTextureID is retained by the backend (through its residency set) until it hasn't
+// been drawn for framesInFlight+2 frames (its last frame has then completed on the GPU), so the app may release
+// its own reference right after the frame that last draws it.
 // Follow "Getting Started" link and check examples/ folder to learn about using backends!
 IMGUI_IMPL_API bool ImGui_ImplMetal4_Init(id<MTLDevice> device, id<MTL4CommandQueue> commandQueue, int framesInFlight);
 IMGUI_IMPL_API void ImGui_ImplMetal4_Shutdown();

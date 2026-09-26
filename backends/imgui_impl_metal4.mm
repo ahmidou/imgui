@@ -91,7 +91,7 @@ struct ImGui_Metal4_ConstantData
 @property (nonatomic, strong) id<MTLSamplerState>           samplerStateLinear;
 @property (nonatomic, strong) id<MTLSamplerState>           samplerStateNearest;
 @property (nonatomic, strong) id<MTLResidencySet>           residencySet;
-@property (nonatomic, strong) NSMapTable<id<MTLTexture>, NSNumber*>* residentDrawables; // drawable render target -> frame index it was last used; lets us evict stale (resized-away) drawables from residencySet instead of leaking them
+@property (nonatomic, strong) NSMapTable<id<MTLTexture>, NSNumber*>* residentTextures; // drawable render target or sampled texture -> frame index it was last used; lets us evict stale ones (resized-away drawables, user textures no longer drawn) from residencySet, which retains them, instead of leaking them
 @property (nonatomic, assign) uint64_t                     residencyFrameCounter;
 @property (nonatomic, strong) FramebufferDescriptor*        framebufferDescriptor;
 @property (nonatomic, strong) NSMutableDictionary*          renderPipelineStateCache;
@@ -154,17 +154,21 @@ bool ImGui_ImplMetal_CreateDeviceObjects(MTL::Device* device)
 
 #pragma mark - Dear ImGui Metal Backend API
 
-// Add a per-frame drawable render target to the residency set (Metal 4 requires it, since the render
-// pass is now built by the app rather than MTKView), tracking the frame it was last used so stale
-// drawables — e.g. the fresh-sized textures a CAMetalLayer produces every frame during a live resize —
-// can be evicted instead of accumulating in the set forever.
-static void ImGui_ImplMetal4_TrackResidentDrawable(MetalContext* ctx, id<MTLTexture> texture)
+// Add a texture used this frame to the residency set (Metal 4 requires it): a per-frame drawable render
+// target (the render pass is now built by the app rather than MTKView), or a texture sampled by a draw
+// command (a user texture or one of our ImTextureData textures). Tracking the frame it was last used lets
+// stale textures — e.g. the fresh-sized drawables a CAMetalLayer produces every frame during a live resize,
+// or user textures the app stopped drawing — be evicted instead of accumulating in the set forever. The
+// residency set retains its allocations, so this also keeps a texture alive until its last frame has
+// completed on the GPU (Metal 4 command buffers don't retain the resources they reference), after which
+// eviction drops that reference and a texture the app has released is freed.
+static void ImGui_ImplMetal4_TrackResidentTexture(MetalContext* ctx, id<MTLTexture> texture)
 {
     if (texture == nil)
         return;
-    if ([ctx.residentDrawables objectForKey:texture] == nil)
+    if ([ctx.residentTextures objectForKey:texture] == nil)
         [ctx.residencySet addAllocation:texture];
-    [ctx.residentDrawables setObject:@(ctx.residencyFrameCounter) forKey:texture];
+    [ctx.residentTextures setObject:@(ctx.residencyFrameCounter) forKey:texture];
 }
 
 void ImGui_ImplMetal4_NewFrame(MTL4RenderPassDescriptor* renderPassDescriptor, int frameInFlightIndex)
@@ -183,26 +187,30 @@ void ImGui_ImplMetal4_NewFrame(MTL4RenderPassDescriptor* renderPassDescriptor, i
 
     // The render pass is now built by the application (no MTKView), so the render-target texture is not
     // automatically resident and must be added to the residency set. Before adding this frame's drawable,
-    // evict any tracked drawable not used for >= framesInFlight+2 frames: the frames-in-flight gate
-    // guarantees its last frame has completed on the GPU and it won't be handed out again (during a live
-    // resize the layer creates a new texture every frame), so this stops the residency set from growing
-    // without bound. Pooled same-size drawables keep getting reused, so they are never evicted.
+    // evict any tracked texture (drawable or sampled) not used for >= framesInFlight+2 frames: the
+    // frames-in-flight gate guarantees its last frame has completed on the GPU and it won't be handed out
+    // again (during a live resize the layer creates a new texture every frame), so this stops the residency
+    // set from growing without bound and releases its reference to user textures the app no longer draws.
+    // Pooled same-size drawables and textures drawn every frame (e.g. the font atlas) are never evicted; a
+    // texture drawn again after being evicted is simply made resident again.
     MetalContext* ctx = bd->SharedMetalContext;
     ctx.residencyFrameCounter++;
-    NSMutableArray<id<MTLTexture>>* staleDrawables = nil;
-    for (id<MTLTexture> texture in ctx.residentDrawables)
-        if (ctx.residencyFrameCounter - [[ctx.residentDrawables objectForKey:texture] unsignedLongLongValue] >= ctx.framesInFlight + 2)
+    NSMutableArray<id<MTLTexture>>* staleTextures = nil;
+    for (id<MTLTexture> texture in ctx.residentTextures)
+        if (ctx.residencyFrameCounter - [[ctx.residentTextures objectForKey:texture] unsignedLongLongValue] >= ctx.framesInFlight + 2)
         {
-            if (staleDrawables == nil)
-                staleDrawables = [NSMutableArray array];
-            [staleDrawables addObject:texture];
+            if (staleTextures == nil)
+                staleTextures = [NSMutableArray array];
+            [staleTextures addObject:texture];
         }
-    for (id<MTLTexture> texture in staleDrawables)
+    for (id<MTLTexture> texture in staleTextures)
     {
         [ctx.residencySet removeAllocation:texture];
-        [ctx.residentDrawables removeObjectForKey:texture];
+        [ctx.residentTextures removeObjectForKey:texture];
     }
-    ImGui_ImplMetal4_TrackResidentDrawable(ctx, renderPassDescriptor.colorAttachments[0].texture);
+    if (staleTextures != nil)
+        [ctx.residencySet commit];
+    ImGui_ImplMetal4_TrackResidentTexture(ctx, renderPassDescriptor.colorAttachments[0].texture);
 
     bd->SharedMetalContext.currentConstantBufferIndex = 0;
     [bd->SharedMetalContext.commandAllocators[frameInFlightIndex] reset];
@@ -387,7 +395,7 @@ void ImGui_ImplMetal4_RenderDrawData(ImDrawData* draw_data, id<MTL4CommandBuffer
                 if (tex_id != ImTextureID_Invalid)
                 {
                     id<MTLTexture> texture = (__bridge id<MTLTexture>)(void*)(intptr_t)tex_id;
-                    [bd->SharedMetalContext.residencySet addAllocation:texture];
+                    ImGui_ImplMetal4_TrackResidentTexture(ctx, texture);
                     [bd->SharedMetalContext.currentArgumentTable setTexture:texture.gpuResourceID atIndex:0];
                 }
 
@@ -458,7 +466,8 @@ void ImGui_ImplMetal4_UpdateTexture(ImTextureData* tex)
         textureDescriptor.storageMode = MTLStorageModeShared;
 
         id <MTLTexture> texture = [bd->SharedMetalContext.device newTextureWithDescriptor:textureDescriptor];
-        [bd->SharedMetalContext.residencySet addAllocation:texture];
+        // Not added to the residency set here: like user textures, it is made resident when drawn (and
+        // evicted once no longer drawn, e.g. after being destroyed), see ImGui_ImplMetal4_TrackResidentTexture().
         [texture replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)tex->Width, (NSUInteger)tex->Height) mipmapLevel:0 withBytes:tex->Pixels bytesPerRow:(NSUInteger)tex->Width * 4];
         MetalTexture* backend_tex = [[MetalTexture alloc] initWithTexture:texture];
 
@@ -499,7 +508,7 @@ bool ImGui_ImplMetal4_CreateDeviceObjects(id<MTLDevice> device)
     IM_ASSERT(bd->SharedMetalContext.residencySet != nil && error == nil);
 
     [bd->SharedMetalContext.commandQueue addResidencySet:bd->SharedMetalContext.residencySet];
-    bd->SharedMetalContext.residentDrawables = [NSMapTable strongToStrongObjectsMapTable];
+    bd->SharedMetalContext.residentTextures = [NSMapTable strongToStrongObjectsMapTable];
     bd->SharedMetalContext.residencyFrameCounter = 0;
 
     MTLDepthStencilDescriptor* depthStencilDescriptor = [[MTLDepthStencilDescriptor alloc] init];
@@ -972,7 +981,7 @@ static void ImGui_ImplMetal_RenderWindow(ImGuiViewport* viewport, void*)
     ImGui_ImplMetal4_Data* bd = ImGui_ImplMetal4_GetBackendData();
     // The secondary-viewport render pass is hand-built here too, so make its render-target texture
     // resident (tracked so it can be evicted once stale) before RenderDrawData commits the residency set.
-    ImGui_ImplMetal4_TrackResidentDrawable(bd->SharedMetalContext, drawable.texture);
+    ImGui_ImplMetal4_TrackResidentTexture(bd->SharedMetalContext, drawable.texture);
     id <MTL4CommandBuffer> commandBuffer = [bd->SharedMetalContext.device newCommandBuffer];
     [commandBuffer beginCommandBufferWithAllocator:bd->SharedMetalContext.commandAllocators[bd->SharedMetalContext.currentFrameSlot]];
 
