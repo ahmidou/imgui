@@ -97,6 +97,9 @@ Other Changes:
 - Demo:
   - Added `Widgets->Mixed Values` section. (#5518, #5677, #6865)
 - Backends:
+  - Metal4: secondary viewports' render encoders start with a consumer queue barrier, so they can
+    sample textures the app rendered earlier on the same queue (Metal 4 doesn't order command buffers
+    on a queue). Shutdown removes the backend's residency set from the queue, which may outlive it.
   - Metal4: evict textures not drawn for framesInFlight+2 frames from the residency set, which
     retains them: user textures (ImTextureID) were never released once drawn. Font atlas textures
     are now made resident when drawn rather than at creation.

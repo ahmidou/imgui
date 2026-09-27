@@ -38,8 +38,11 @@
 // references) until it hasn't been drawn for framesInFlight+2 frames (its last frame has then completed on the GPU),
 // so the app may release its own reference right after the frame that last draws it. This relies on your
 // frames-in-flight gate covering the platform windows' submissions too: signal it after RenderPlatformWindowsDefault().
+// If commandQueue is shared with your rendering, begin the encoder you pass to RenderDrawData() with a consumer barrier
+// (barrierAfterQueueStages:beforeStages:visibilityOptions:); secondary viewports do this themselves.
 // Follow "Getting Started" link and check examples/ folder to learn about using backends!
 IMGUI_IMPL_API bool ImGui_ImplMetal4_Init(id<MTLDevice> device, id<MTL4CommandQueue> commandQueue, int framesInFlight);
+// Call only once the last frame's GPU work has completed: this releases the backend's resources and residency set.
 IMGUI_IMPL_API void ImGui_ImplMetal4_Shutdown();
 // frameInFlightIndex must match the slot you use to index your own per-frame-in-flight resources
 // (e.g. the same index used to pick your command buffer/allocator), and must be < framesInFlight passed to Init().

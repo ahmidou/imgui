@@ -21,6 +21,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2026-09-26: Metal 4: secondary viewports' render encoders start with a consumer queue barrier, so they can sample textures rendered earlier on a shared queue. Shutdown removes the residency set from the queue.
 //  2026-09-26: Metal 4: evict textures not drawn for framesInFlight+2 frames from the residency set (fixes user textures never being released).
 //  2026-09-07: Round framebuffer dimensions to the nearest integer instead of truncating them. (#9538, 9515, #8628)
 //  2026-08-06: Metal 4: fixed resizing windows losing framebuffer scale. (#6828, #8856)
@@ -637,6 +638,8 @@ void ImGui_ImplMetal4_Shutdown()
 
     ImGui_ImplMetal_ShutdownMultiViewportSupport();
     ImGui_ImplMetal4_DestroyDeviceObjects();
+    // The queue may be the app's and outlive the backend: the set retains everything it holds.
+    [bd->SharedMetalContext.commandQueue removeResidencySet:bd->SharedMetalContext.residencySet];
     ImGui_ImplMetal4_DestroyBackendData();
 
     io.BackendRendererName = nullptr;
@@ -1001,6 +1004,10 @@ static void ImGui_ImplMetal_RenderWindow(ImGuiViewport* viewport, void*)
     [commandBuffer beginCommandBufferWithAllocator:bd->SharedMetalContext.commandAllocators[bd->SharedMetalContext.currentFrameSlot]];
 
     id <MTL4RenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+    // Metal 4 doesn't order command buffers on a queue: user textures this window samples may have been rendered by earlier
+    // work on the (possibly shared) queue, so make the fragment stage wait for it and see its writes. Only this pass's fragment
+    // stage waits (its vertex work and load/clear can still overlap); it serializes its fragment work behind earlier queue work.
+    [renderEncoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice];
     ImGui_ImplMetal4_RenderDrawData(viewport->DrawData, commandBuffer, renderEncoder);
     [renderEncoder endEncoding];
     [commandBuffer endCommandBuffer];
